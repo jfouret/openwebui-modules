@@ -204,6 +204,7 @@ class Tools:
 
         # Fetch results for each query
         all_results = []
+        all_pmids = []
         for i, search_query in enumerate(queries):
             await emitter.emit(
                 f"Searching EuropePMC for query {i+1}/{len(queries)}: {search_query}"
@@ -216,12 +217,17 @@ class Tools:
 
                 if "resultList" in results and "result" in results["resultList"]:
                     articles = results["resultList"]["result"]
-                    all_results.extend(articles)
 
                     # Emit citations for each article
                     if citation_enabled and __event_emitter__:
                         for article in articles:
                             # Extract title and abstract
+                            pmid = article.get("pmid", "")
+                            if pmid not in all_pmids:
+                                all_pmids.append(pmid)
+                                all_results.append(article)
+                            else:
+                                continue
                             title = article.get("title", "No title available")
 
                             # The abstract might not be in the lite result type
@@ -268,21 +274,12 @@ class Tools:
                     done=False,
                 )
 
-        # Remove duplicates based on PMID
-        unique_results = []
-        seen_pmids = set()
-        for article in all_results:
-            pmid = article.get("pmid", "")
-            if pmid and pmid not in seen_pmids:
-                seen_pmids.add(pmid)
-                unique_results.append(article)
-
         # Format results
-        formatted_results = self._format_results(unique_results)
+        formatted_results = self._format_results(all_results)
 
         await emitter.emit(
             status="complete",
-            description=f"Found {len(unique_results)} unique articles from EuropePMC",
+            description=f"Found {len(all_results)} unique articles from EuropePMC\n-  "+"\n-  ".join(queries),
             done=True,
         )
 
