@@ -2,7 +2,7 @@
 title: EuropePMC Fetcher
 author: jfouret
 description: Fetches scientific articles from EuropePMC API with Mistral AI query generation
-version: 0.1.0
+version: 0.1.1
 license: MIT
 requirements: requests, asyncio, mistralai
 """
@@ -45,6 +45,9 @@ class Tools:
         num_queries: int = Field(
             default=3, description="Number of queries to generate with Mistral AI (1-5)"
         )
+        max_retries: int = Field(
+            default=3, description="Number of retries for Mistral AI query generation if format is incorrect"
+        )
         max_results: int = Field(
             default=10, description="Maximum number of results to return per query"
         )
@@ -70,7 +73,7 @@ class Tools:
         )
 
     async def _generate_queries_with_mistral(
-        self, user_query: str, api_key: str, num_queries: int
+        self, user_query: str, api_key: str, num_queries: int, max_retries: int = 3
     ) -> List[str]:
         """
         Generate a list of search queries using Mistral AI based on user input.
@@ -78,6 +81,7 @@ class Tools:
         :param user_query: The user's original query
         :param api_key: Mistral AI API key
         :param num_queries: Number of queries to generate (1-5)
+        :param max_retries: Maximum number of retries if format is incorrect
         :return: List of generated search queries
         """
         # If no API key is provided, just return the original query
@@ -88,48 +92,89 @@ class Tools:
         num_queries = max(1, min(5, num_queries))
 
         try:
-            from mistralai.client import MistralClient
+            # Import the new Mistral AI client
+            from mistralai import Mistral
+            client = Mistral(api_key=api_key)
 
-            client = MistralClient(api_key=api_key)
+            # Create system and user messages with detailed prompt
+            system_message = ""
+            user_message = f"""
+## Task
+Generate optimized search queries for EuropePMC based on the user's medical or scientific research question. Your queries should cover different aspects and synonyms of the topic to ensure comprehensive search results. Each query should be tailored for scientific literature search in the medical and biological domains.
+Generate exactly {num_queries} queries. Each query should be a string optimized for scientific literature search. Do not include any explanations or additional text outside of the JSON object.
 
-            # Create system and user messages
+## Initial User Query 
+{user_query}
+
+## Output format
+Return ONLY a JSON object with the following format:
+```json
+{{
+  "queries": ["query1", "query2", "query3", ...]
+}}
+```
+## Example
+- user: I want to know about the relationship between gut microbiome and Parkinson's disease
+- assistant: {{"queries":["gut microbiome Parkinson's disease association", "intestinal microbiota neurodegeneration Parkinson", "microbiome dysbiosis Parkinson's pathophysiology", "gastrointestinal microbiome neurological disorders Parkinson's"]}}
+"""
+
+            # Create messages using the new ChatMessage class
             messages = [
                 {
                     "role": "system",
-                    "content": "You are a scientific research assistant specialized in medical and biological literature. Generate a list of search queries for EuropePMC based on the user's request. Your queries should cover different aspects and synonyms of the topic to ensure comprehensive search results.",
+                    "content": system_message,
                 },
                 {
                     "role": "user",
-                    "content": f'Generate exactly {num_queries} search queries for EuropePMC on this topic: ```{user_query}```. Return ONLY a JSON object with format: {{"queries": ["query1", "query2", ...]}}. Each query should be optimized for scientific literature search.',
+                    "content": user_message,
                 },
             ]
 
-            # Use JSON mode to ensure structured output
-            chat_response = client.chat.completions.create(
-                model="mistral-large-latest",
-                messages=messages,
-                response_format={"type": "json_object"},
-            )
-
-            response_content = chat_response.choices[0].message.content
-
-            # Parse the JSON response
-            try:
-                queries_json = json.loads(response_content)
-                queries = queries_json.get("queries", [])
-
-                # If we got valid queries, return them
-                if queries and isinstance(queries, list) and len(queries) > 0:
-                    return queries
-                else:
-                    print(
-                        "Invalid queries format from Mistral AI, using original query"
+            # Implement retry logic
+            retry_count = 0
+            while retry_count <= max_retries:
+                try:
+                    # Use JSON mode to ensure structured output
+                    chat_response = client.chat.complete(
+                        model="mistral-large-latest",
+                        messages=messages,
+                        response_format={"type": "json_object"},
                     )
-                    return [user_query]
 
-            except json.JSONDecodeError as e:
-                print(f"Error parsing JSON from Mistral AI: {str(e)}")
-                return [user_query]
+                    response_content = chat_response.choices[0].message.content
+
+                    # Parse the JSON response
+                    queries_json = json.loads(response_content)
+                    queries = queries_json.get("queries", [])
+
+                    # If we got valid queries, return them
+                    if queries and isinstance(queries, list) and len(queries) > 0:
+                        return queries
+                    
+                    # If format is incorrect but we have retries left
+                    if retry_count < max_retries:
+                        print(f"Invalid queries format, retrying ({retry_count + 1}/{max_retries})")
+                        retry_count += 1
+                    else:
+                        print(f"Invalid queries format after {max_retries} retries, using original query")
+                        return [user_query]
+
+                except json.JSONDecodeError as e:
+                    # JSON parsing error, retry if possible
+                    if retry_count < max_retries:
+                        print(f"Error parsing JSON, retrying ({retry_count + 1}/{max_retries}): {str(e)}")
+                        retry_count += 1
+                    else:
+                        print(f"Error parsing JSON after {max_retries} retries: {str(e)}")
+                        return [user_query]
+                except Exception as e:
+                    # Other errors, retry if possible
+                    if retry_count < max_retries:
+                        print(f"Error generating queries, retrying ({retry_count + 1}/{max_retries}): {str(e)}")
+                        retry_count += 1
+                    else:
+                        print(f"Error generating queries after {max_retries} retries: {str(e)}")
+                        return [user_query]
 
         except Exception as e:
             print(f"Error using Mistral AI: {str(e)}")
@@ -191,9 +236,28 @@ class Tools:
         # Generate queries with Mistral AI
         await emitter.emit("Generating optimized search queries with Mistral AI")
         try:
+            max_retries = user_valves.max_retries
             queries = await self._generate_queries_with_mistral(
-                query, mistral_api_key, num_queries
+                query, mistral_api_key, num_queries, max_retries
             )
+            
+            # Emit a message with the generated queries
+            if __event_emitter__ and queries:
+                # Format queries as a markdown list
+                queries_markdown = "> Generated Search Queries\n"
+                for i, q in enumerate(queries):
+                    queries_markdown += f"> {i+1}. {q}\n"
+                queries_markdown += "\n"
+                # Emit the message
+                await __event_emitter__(
+                    {
+                        "type": "message",
+                        "data": {
+                            "content": queries_markdown
+                        },
+                    }
+                )
+                
         except Exception as e:
             await emitter.emit(
                 status="error",
@@ -279,7 +343,7 @@ class Tools:
 
         await emitter.emit(
             status="complete",
-            description=f"Found {len(all_results)} unique articles from EuropePMC\n-  "+"\n-  ".join(queries),
+            description=f"Found {len(all_results)} unique articles from EuropePMC",
             done=True,
         )
 
