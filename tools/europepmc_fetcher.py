@@ -20,6 +20,7 @@ class EventEmitter:
         self.event_emitter = event_emitter
 
     async def emit(self, description="Unknown State", status="in_progress", done=False):
+        """Emit a status update."""
         if self.event_emitter:
             await self.event_emitter(
                 {
@@ -28,6 +29,18 @@ class EventEmitter:
                         "status": status,
                         "description": description,
                         "done": done,
+                    },
+                }
+            )
+
+    async def emit_message(self, content):
+        """Emit a message with the given content."""
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "message",
+                    "data": {
+                        "content": content
                     },
                 }
             )
@@ -229,34 +242,31 @@ Return ONLY a JSON object with the following format:
         max_results = user_valves.max_results
         result_type = user_valves.result_type
         citation_enabled = user_valves.citation_enabled
-
+        
+        # Initialize the event emitter
         emitter = EventEmitter(__event_emitter__)
+        
+        # Emit status update
         await emitter.emit(f"Processing query: {query}")
 
         # Generate queries with Mistral AI
         await emitter.emit("Generating optimized search queries with Mistral AI")
+        
+        # Initialize the details content
+        details_content = """<details>
+<summary>EuropePMC advanced search details</summary>
+### Queries generated with mistral ai
+"""
+        
         try:
             max_retries = user_valves.max_retries
             queries = await self._generate_queries_with_mistral(
                 query, mistral_api_key, num_queries, max_retries
             )
             
-            # Emit a message with the generated queries
-            if __event_emitter__ and queries:
-                # Format queries as a markdown list
-                queries_markdown = "> Generated Search Queries\n"
-                for i, q in enumerate(queries):
-                    queries_markdown += f"> {i+1}. {q}\n"
-                queries_markdown += "\n"
-                # Emit the message
-                await __event_emitter__(
-                    {
-                        "type": "message",
-                        "data": {
-                            "content": queries_markdown
-                        },
-                    }
-                )
+            # Add generated queries to the details content
+            for q in queries:
+                details_content += f"- {q}\n"
                 
         except Exception as e:
             await emitter.emit(
@@ -265,22 +275,32 @@ Return ONLY a JSON object with the following format:
                 done=True,
             )
             queries = [query]  # Fallback to original query
+            
+            # Add error message to the details content
+            details_content += f"- Error generating queries: {str(e)}\n- Using original query: {query}\n"
 
+        # Add EuropePMC searches section
+        details_content += "\n### EuropePMC searches\n"
+        
         # Fetch results for each query
         all_results = []
         all_pmids = []
+        
         for i, search_query in enumerate(queries):
             await emitter.emit(
                 f"Searching EuropePMC for query {i+1}/{len(queries)}: {search_query}"
             )
-
+            
             try:
                 results = await self._fetch_europepmc_results(
                     search_query, result_type, max_results
                 )
-
+                
+                # Count articles found for this query
+                article_count = 0
                 if "resultList" in results and "result" in results["resultList"]:
                     articles = results["resultList"]["result"]
+                    article_count = len(articles)
 
                     # Emit citations for each article
                     if citation_enabled and __event_emitter__:
@@ -331,16 +351,33 @@ Return ONLY a JSON object with the following format:
                                     },
                                 }
                             )
+                
+                # Add search result to the details content
+                details_content += f"- Query {i+1}: \"{search_query}\" - Found {article_count} articles\n"
+                
             except Exception as e:
                 await emitter.emit(
                     status="warning",
                     description=f"Error fetching results for query '{search_query}': {str(e)}",
                     done=False,
                 )
+                
+                # Add error message to the details content
+                details_content += f"- Query {i+1}: \"{search_query}\" - Error: {str(e)}\n"
+
+        # Add summary to the details content
+        details_content += f"\n### Summary\nFound {len(all_pmids)} unique articles from {len(queries)} queries\n"
+        
+        # Close the details tag
+        details_content += "</details>"
+        
+        # Emit the details content
+        await emitter.emit_message(details_content)
 
         # Format results
         formatted_results = self._format_results(all_results)
 
+        # Emit final status
         await emitter.emit(
             status="complete",
             description=f"Found {len(all_results)} unique articles from EuropePMC",

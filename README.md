@@ -31,6 +31,13 @@ The most important documentation files for development are:
 - `docs/features/plugin/functions/filter.mdx` - Guide for developing filter functions
 - `docs/features/plugin/functions/pipe.mdx` - Guide for developing pipe functions
 
+## Local Development Notes
+
+Additional notes for developers working with Open WebUI:
+
+- `notes_on_event_emitter.md` - Detailed information about the `__event_emitter__` and `__event_call__` functions
+- `notes_on_tool_calls.md` - Guide for using tool calls to create collapsible UI elements
+
 ## Development Quick Reference
 
 ### Tools Development
