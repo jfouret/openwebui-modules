@@ -420,7 +420,7 @@ Return ONLY a JSON object with the following format:
         mistral_api_key: str,
         max_retries: int,
         __event_emitter__ = None
-    ) -> List[Dict]:
+    ) -> Tuple[List[Dict], str]:
         """
         Rerank articles using Cohere's rerank API.
 
@@ -437,6 +437,9 @@ Return ONLY a JSON object with the following format:
         :param __event_emitter__: EventEmitter for status updates
         :return: List of filtered articles
         """
+        # Initialize details string
+        details_string = "#### Reranking Details\n"
+        
         # Create a dictionary to map PMIDs to articles for easy lookup
         pmid_to_article = {article.get("pmid", ""): article for article in all_articles}
         emitter = EventEmitter(__event_emitter__)
@@ -451,9 +454,20 @@ Return ONLY a JSON object with the following format:
             "You are a helpful assistant that generates natural language queries for scientific article reranking."
         )
         
+        # Add rerank responses to details
+        details_string += f"- Number of reranking queries: {len(rerank_queries)}\n"
+        details_string += "- Reranking queries generated:\n"
+        for i, q in enumerate(rerank_queries):
+            details_string += f"  - Query {i+1}: `{q}`\n"
+        
+        details_string += "- Mistral AI reranking query generations:\n"
+        for i, response in enumerate(rerank_responses):
+            details_string += f"  - Response {i+1}:\n```\n{response}\n```\n"
+        
         # If no queries were generated, use the original query
         if not rerank_queries:
             rerank_queries = [query]
+            details_string += "- No reranking queries generated, using original query\n"
         
         # Prepare documents for reranking
         all_chunks = []
@@ -475,9 +489,14 @@ Return ONLY a JSON object with the following format:
                 all_chunks.append(chunk)
                 ordered_chunk_ids.append(chunk["id"])
         
+        details_string += f"- Total articles: {len(all_articles)}\n"
+        details_string += f"- Total chunks created: {len(all_chunks)}\n"
+        details_string += f"- Chunk size: {chunk_size} words with {chunk_overlap} words overlap\n"
+        
         # If no chunks, return all articles with no relevance scores
         if not all_chunks:
-            return all_articles, {}
+            details_string += "- No chunks created, returning all articles without reranking\n"
+            return all_articles, details_string
         
         # Initialize combined relevance scores dictionary
         combined_pmid_relevance = {}
@@ -493,7 +512,9 @@ Return ONLY a JSON object with the following format:
             for i, rerank_query in enumerate(rerank_queries):
                 if emitter:
                     await emitter.emit(f"Reranking with query {i+1}/{len(rerank_queries)}: {rerank_query}")
-                                    
+                
+                details_string += f"\n- Reranking with query {i+1}: `{rerank_query}`\n"
+                
                 # Call Cohere rerank API
                 response = co.rerank(
                     model="rerank-v3.5",
@@ -504,6 +525,10 @@ Return ONLY a JSON object with the following format:
                 
                 # Process reranking results for this query
                 query_pmid_relevance = self._process_rerank_results(response, ordered_chunk_ids)
+                
+                # Add details about results for this query
+                details_string += f"  - Unique PMIDs in results: {len(query_pmid_relevance)}\n"
+                
                 # Update combined relevance scores
                 for pmid, relevance in query_pmid_relevance.items():
                     if pmid in combined_pmid_relevance.keys():
@@ -515,17 +540,27 @@ Return ONLY a JSON object with the following format:
             # Create a filtered list of results based on combined reranking
             sorted_combined_pmids = sorted(combined_pmid_relevance.items(), key=lambda x: x[1], reverse=True)
             filtered_articles = []
+            
+            details_string += f"\n- Final reranking results:\n"
+            details_string += f"  - Total unique PMIDs with relevance scores: {len(combined_pmid_relevance)}\n"
+            
             for pmid, relevance in sorted_combined_pmids:
                 article = pmid_to_article.get(pmid)
                 if article:
                     article['relevance'] = relevance
                     filtered_articles.append(article)
-            return filtered_articles
+            
+            details_string += f"  - Articles after reranking: {len(filtered_articles)}\n"
+                        
+            return filtered_articles, details_string
             
         except Exception as e:
-            print(f"Error in reranking process: {str(e)}")
+            error_msg = f"Error in reranking process: {str(e)}"
+            print(error_msg)
+            details_string += f"\n- {error_msg}\n"
+            details_string += "- Returning all articles without reranking due to error\n"
             # Return all articles with no relevance scores on error
-            return all_articles
+            return all_articles, details_string
 
     def _process_rerank_results(self, rerank_results: Dict, ordered_chunk_ids: List[str]) -> Dict[str, float]:
         """
@@ -537,15 +572,14 @@ Return ONLY a JSON object with the following format:
         """
         # Extract PMIDs and relevance scores
         pmid_relevance = {}
-        
-        if "results" in rerank_results:
-            for result in rerank_results["results"]:
-                chunk_id = ordered_chunk_ids[result["index"]]
-                pmid = chunk_id.split("-")[0]
-                relevance = result["relevance_score"]
-                
-                if pmid not in pmid_relevance or relevance > pmid_relevance[pmid]:
-                    pmid_relevance[pmid] = relevance
+
+        for idx, result in enumerate(rerank_results.results):
+            chunk_id = ordered_chunk_ids[result.index]
+            pmid = chunk_id.split("-")[0]
+            relevance = result.relevance_score
+            
+            if pmid not in pmid_relevance or relevance > pmid_relevance[pmid]:
+                pmid_relevance[pmid] = relevance
                 
         return pmid_relevance
 
@@ -704,7 +738,7 @@ Return ONLY a JSON object with the following format:
             details_content += "\n### Cohere Reranking\n"
             
             # Use the refactored reranking function
-            filtered_results = await self._rerank_with_cohere(
+            filtered_results, rerank_details = await self._rerank_with_cohere(
                 query=query,
                 all_articles=all_results,
                 api_key=cohere_api_key,
@@ -717,6 +751,9 @@ Return ONLY a JSON object with the following format:
                 max_retries=max_retries,
                 __event_emitter__=__event_emitter__
             )
+            
+            # Append reranking details to details_content
+            details_content += rerank_details
             
             if len(filtered_results) < len(all_results):
                 details_content += f"- Reranking filtered results from {len(all_results)} to {len(filtered_results)} articles\n"
