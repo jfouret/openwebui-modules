@@ -1,10 +1,10 @@
 """
 title: EuropePMC Fetcher
 author: jfouret
-description: Fetches scientific articles from EuropePMC API with Mistral AI query generation
-version: 0.1.3
+description: Fetches scientific articles from EuropePMC API with Mistral AI query generation and Cohere reranking
+version: 0.2.0
 license: MIT
-requirements: requests, asyncio, mistralai
+requirements: requests, asyncio, mistralai, cohere, pandas
 """
 
 import requests
@@ -12,8 +12,7 @@ import asyncio
 import json
 from datetime import datetime
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Union, Callable, Any
-
+from typing import List, Dict, Optional, Union, Callable, Any, Tuple
 
 class EventEmitter:
     def __init__(self, event_emitter: Callable[[dict], Any] = None):
@@ -29,6 +28,44 @@ class EventEmitter:
                         "status": status,
                         "description": description,
                         "done": done,
+                    },
+                }
+            )
+    
+    async def emit_citation(self, article):
+        """Emit a citation."""
+        pmid = article.get("pmid", "")
+        title = article.get("title", "No title available")
+        abstract = article.get(
+            "abstractText", "No abstract available"
+        )
+        content = f"# {title}\n\n{abstract}"
+
+        pmid = article.get("pmid", "")
+
+        metadata = {
+            "pmid": pmid,
+            "doi": article.get("doi", ""),
+            "authors": article.get("authorString", ""),
+            "journal": article.get("journalTitle", ""),
+            "relevance": article.get("relevance", None),
+            "publication_date": article.get(
+                "firstPublicationDate", ""
+            ),
+            "source": f"EuropePMC:{pmid}",
+        }
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "citation",
+                    "data": {
+                        "document": [content],
+                        "metadata": [metadata],
+                        "source": {
+                            "id": pmid,
+                            "name": title,
+                            "url": f"https://europepmc.org/article/MED/{pmid}",
+                        },
                     },
                 }
             )
@@ -51,6 +88,10 @@ class Tools:
         mistral_api_key: str = Field(
             default="",
             description="Mistral AI API key for query generation (admin only)",
+        )
+        cohere_api_key: str = Field(
+            default="",
+            description="Cohere API key for reranking (required if use_reranking is True)"
         )
         pass
 
@@ -151,6 +192,64 @@ Return ONLY a JSON object with the following format:
 ]}}""",
             description="User prompt template for Mistral AI query generation"
         )
+        # New parameters for Cohere reranking
+        use_reranking: bool = Field(
+            default=True,
+            description="Enable/disable reranking of results using Cohere"
+        )
+        chunk_size: int = Field(
+            default=200,
+            description="Size of text chunks in words for reranking"
+        )
+        chunk_overlap: int = Field(
+            default=50,
+            description="Overlap between chunks in words"
+        )
+        top_n: int = Field(
+            default=3,
+            description="Number of top results to keep after reranking"
+        )
+        num_queries_rerank: int = Field(
+            default=1, 
+            description="Number of reranking queries to generate with Mistral AI (1-3)"
+        )
+        rerank_query_prompt: str = Field(
+            default="""## Task
+Generate exactly {num_queries_rerank} queries. Each query should be human-readable ranking query based on the user's medical or scientific research question.
+This queries will be used for reranking scientific articles, so it should be conversational and descriptive rather than using specialized search syntax.
+
+Your queries should:
+- Be phrased as a natural language question or statement
+- Include key concepts, terms, and relationships from the original query
+- Be specific enough to identify relevant content
+- Be general enough to capture different phrasings of the same concepts
+
+## Initial User Query 
+{user_query}
+
+## Output format
+Return ONLY a JSON object with the following format:
+```json
+{{
+  "queries": [
+    "your natural language query here",
+    "another query if needed"
+  ]
+}}
+```
+
+## Examples
+- User: "I want to know about the relationship between gut microbiome and Parkinson's disease"
+- Assistant: {{"queries": ["How does the gut microbiome influence or relate to Parkinson's disease pathology, symptoms, or progression?"]}}
+
+- User: "Recent advances in CRISPR gene editing for cystic fibrosis"
+- Assistant: {{"queries": [
+    "What are the latest developments in using CRISPR gene editing technology to treat or cure cystic fibrosis?"}}
+    "How have recent CRISPR gene editing studies impacted the treatment of cystic fibrosis?"
+]}}
+""",
+            description="Prompt for Mistral AI to generate human-readable reranking queries"
+        )
         pass
 
     def __init__(self):
@@ -169,7 +268,7 @@ Return ONLY a JSON object with the following format:
     async def _generate_queries_with_mistral(
         self, user_query: str, api_key: str, num_queries: int,
         max_retries: int = 3, user_template: str = None, system_message: str = None
-    ) -> List[str]:
+    ) -> Tuple[List[str], List[str]]:
         """
         Generate a list of search queries using Mistral AI based on user input.
 
@@ -179,11 +278,11 @@ Return ONLY a JSON object with the following format:
         :param max_retries: Maximum number of retries if format is incorrect
         :param user_template: User prompt template
         :param system_message: System prompt 
-        :return: List of generated search queries
+        :return: Tuple of (all_responses, queries)
         """
         # If no API key is provided, just return the original query
         if not api_key:
-            return [user_query]
+            return [], [user_query]
 
         # Ensure num_queries is within valid range
         num_queries = max(1, min(5, num_queries))
@@ -230,6 +329,10 @@ Return ONLY a JSON object with the following format:
                     # Parse the JSON response
                     queries_json = json.loads(response_content)
                     queries = queries_json.get("queries", [])
+                    
+                    # Check if we're getting a single query (for reranking)
+                    if not queries and "query" in queries_json:
+                        return all_responses, [queries_json["query"]]
 
                     # If we got valid queries, return them
                     if queries and isinstance(queries, list) and len(queries) > 0:
@@ -265,6 +368,187 @@ Return ONLY a JSON object with the following format:
             # Fallback to original query
             return all_responses, [user_query]
 
+    def _chunk_text_by_words(self, text: str, pmid: str, chunk_size: int, chunk_overlap: int) -> List[Dict]:
+        """
+        Split article text into overlapping chunks with unique IDs based on word count.
+        
+        :param text: The text to chunk (title + abstract)
+        :param pmid: The PMID of the article
+        :param chunk_size: Number of words per chunk
+        :param chunk_overlap: Number of words to overlap between chunks
+        :return: List of dicts with 'id' and 'text' keys
+        """
+        # Split text into words
+        words = text.split()
+        
+        # If text is shorter than chunk_size, return it as a single chunk
+        if len(words) <= chunk_size:
+            return [{"id": f"{pmid}-0", "text": text}]
+        
+        chunks = []
+        stride = chunk_size - chunk_overlap
+        
+        # Create chunks with overlap
+        for i in range(0, len(words), stride):
+            # Get chunk of words
+            chunk_words = words[i:i + chunk_size]
+            
+            # Skip if we have less than half the chunk size (for the last chunk)
+            if len(chunk_words) < chunk_size // 2:
+                continue
+                
+            # Join words back into text
+            chunk_text = " ".join(chunk_words)
+            
+            # Create unique ID for this chunk
+            chunk_id = f"{pmid}-{len(chunks)}"
+            
+            chunks.append({"id": chunk_id, "text": chunk_text})
+        
+        return chunks
+
+    async def _rerank_with_cohere(
+        self, 
+        query: str, 
+        all_articles: List[Dict], 
+        api_key: str, 
+        chunk_size: int, 
+        chunk_overlap: int,
+        top_n: int,
+        num_queries_rerank: int,
+        rerank_query_prompt: str,
+        mistral_api_key: str,
+        max_retries: int,
+        __event_emitter__ = None
+    ) -> List[Dict]:
+        """
+        Rerank articles using Cohere's rerank API.
+
+        :param query: The original user query
+        :param all_articles: List of all articles to rerank
+        :param api_key: Cohere API key
+        :param chunk_size: Size of text chunks in words
+        :param chunk_overlap: Overlap between chunks in words
+        :param top_n: Number of top results to keep per query
+        :param num_queries_rerank: Number of reranking queries to generate
+        :param rerank_query_prompt: Prompt for generating reranking queries
+        :param mistral_api_key: Mistral API key for generating queries
+        :param max_retries: Maximum number of retries for query generation
+        :param __event_emitter__: EventEmitter for status updates
+        :return: List of filtered articles
+        """
+        # Create a dictionary to map PMIDs to articles for easy lookup
+        pmid_to_article = {article.get("pmid", ""): article for article in all_articles}
+        emitter = EventEmitter(__event_emitter__)
+        
+        # Generate multiple reranking queries with Mistral
+        if emitter:
+            await emitter.emit("Generating human-readable queries for reranking")
+        
+        num_queries_rerank = min(3, max(1, num_queries_rerank))
+        rerank_responses, rerank_queries = await self._generate_queries_with_mistral(
+            query, mistral_api_key, num_queries_rerank, max_retries, rerank_query_prompt, 
+            "You are a helpful assistant that generates natural language queries for scientific article reranking."
+        )
+        
+        # If no queries were generated, use the original query
+        if not rerank_queries:
+            rerank_queries = [query]
+        
+        # Prepare documents for reranking
+        all_chunks = []
+        ordered_chunk_ids = []
+        
+        for article in all_articles:
+            pmid = article.get("pmid", "")
+            title = article.get("title", "No title available")
+            abstract = article.get("abstractText", "No abstract available")
+            
+            # Combine title and abstract for chunking
+            full_text = f"{title}\n\n{abstract}"
+            
+            # Chunk the text
+            chunks = self._chunk_text_by_words(full_text, pmid, chunk_size, chunk_overlap)
+            
+            # Add chunks to the list
+            for chunk in chunks:
+                all_chunks.append(chunk)
+                ordered_chunk_ids.append(chunk["id"])
+        
+        # If no chunks, return all articles with no relevance scores
+        if not all_chunks:
+            return all_articles, {}
+        
+        # Initialize combined relevance scores dictionary
+        combined_pmid_relevance = {}
+        all_dfs = []
+        
+        try:
+            import cohere
+            
+            # Initialize Cohere client
+            co = cohere.ClientV2(api_key=api_key)
+            
+            # Process each reranking query
+            for i, rerank_query in enumerate(rerank_queries):
+                if emitter:
+                    await emitter.emit(f"Reranking with query {i+1}/{len(rerank_queries)}: {rerank_query}")
+                                    
+                # Call Cohere rerank API
+                response = co.rerank(
+                    model="rerank-v3.5",
+                    query=rerank_query,
+                    documents=all_chunks,
+                    top_n=top_n,
+                )
+                
+                # Process reranking results for this query
+                query_pmid_relevance = self._process_rerank_results(response, ordered_chunk_ids)
+                # Update combined relevance scores
+                for pmid, relevance in query_pmid_relevance.items():
+                    if pmid in combined_pmid_relevance.keys():
+                        old_relevance = combined_pmid_relevance[pmid]
+                    if (not pmid in combined_pmid_relevance.keys()) or (relevance > old_relevance):
+                        combined_pmid_relevance[pmid] = relevance
+
+            
+            # Create a filtered list of results based on combined reranking
+            sorted_combined_pmids = sorted(combined_pmid_relevance.items(), key=lambda x: x[1], reverse=True)
+            filtered_articles = []
+            for pmid, relevance in sorted_combined_pmids:
+                article = pmid_to_article.get(pmid)
+                if article:
+                    article['relevance'] = relevance
+                    filtered_articles.append(article)
+            return filtered_articles
+            
+        except Exception as e:
+            print(f"Error in reranking process: {str(e)}")
+            # Return all articles with no relevance scores on error
+            return all_articles
+
+    def _process_rerank_results(self, rerank_results: Dict, ordered_chunk_ids: List[str]) -> Dict[str, float]:
+        """
+        Process reranking results to get PMIDs and relevance scores.
+        
+        :param rerank_results: Results from Cohere rerank
+        :param ordered_chunk_ids: List of chunk IDs in the same order as the documents sent to rerank
+        :return: List of Dict with pmid and relevance score
+        """
+        # Extract PMIDs and relevance scores
+        pmid_relevance = {}
+        
+        if "results" in rerank_results:
+            for result in rerank_results["results"]:
+                chunk_id = ordered_chunk_ids[result["index"]]
+                pmid = chunk_id.split("-")[0]
+                relevance = result["relevance_score"]
+                
+                if pmid not in pmid_relevance or relevance > pmid_relevance[pmid]:
+                    pmid_relevance[pmid] = relevance
+                
+        return pmid_relevance
+
     async def _fetch_europepmc_results(
         self, query: str, result_type: str, max_results: int
     ) -> Dict:
@@ -297,7 +581,8 @@ Return ONLY a JSON object with the following format:
         self, query: str, __user__: dict = None, __event_emitter__=None
     ) -> str:
         """
-        Search EuropePMC for scientific articles based on a query, with Mistral AI query enhancement.
+        Search EuropePMC for scientific articles based on a query, with Mistral AI query enhancement
+        and optional Cohere reranking.
 
         :param query: The search query
         :return: Formatted results from EuropePMC
@@ -315,6 +600,14 @@ Return ONLY a JSON object with the following format:
         user_prompt = user_valves.user_prompt
         system_prompt = user_valves.system_prompt
         citation_enabled = user_valves.citation_enabled
+        
+        # Get reranking parameters
+        use_reranking = user_valves.use_reranking
+        cohere_api_key = self.valves.cohere_api_key
+        chunk_size = user_valves.chunk_size
+        chunk_overlap = user_valves.chunk_overlap
+        top_n = user_valves.top_n
+        rerank_query_prompt = user_valves.rerank_query_prompt
         
         # Initialize the event emitter
         emitter = EventEmitter(__event_emitter__)
@@ -349,13 +642,15 @@ Return ONLY a JSON object with the following format:
         for q in queries:
             details_content += f"- {q}\n"
 
-
         # Add EuropePMC searches section
         details_content += "\n### EuropePMC searches\n"
         
         # Fetch results for each query
         all_results = []
         all_pmids = []
+        
+        # Dictionary to store all articles by PMID for later reranking
+        pmid_to_article = {}
         
         for i, search_query in enumerate(queries):
             await emitter.emit(
@@ -372,56 +667,17 @@ Return ONLY a JSON object with the following format:
                 if "resultList" in results and "result" in results["resultList"]:
                     articles = results["resultList"]["result"]
 
-                    # Emit citations for each article
-                    if citation_enabled and __event_emitter__:
-                        for article in articles:
-                            # Extract title and abstract
-                            pmid = article.get("pmid", "")
-                            if pmid not in all_pmids:
-                                all_pmids.append(pmid)
-                                all_results.append(article)
-                                article_count += 1
-                            else:
-                                continue
-                            title = article.get("title", "No title available")
-
-                            # The abstract might not be in the lite result type
-                            # In a real implementation, you might need to make additional API calls
-                            abstract = article.get(
-                                "abstractText", "No abstract available"
-                            )
-
-                            # Create citation content
-                            content = f"# {title}\n\n{abstract}"
-
-                            pmid = article.get("pmid", "")
-
-                            # Create metadata
-                            metadata = {
-                                "pmid": pmid,
-                                "doi": article.get("doi", ""),
-                                "authors": article.get("authorString", ""),
-                                "journal": article.get("journalTitle", ""),
-                                "publication_date": article.get(
-                                    "firstPublicationDate", ""
-                                ),
-                                "source": f"EuropePMC:{pmid}",
-                            }
-
-                            # Emit citation
-                            await __event_emitter__(
-                                {
-                                    "type": "citation",
-                                    "data": {
-                                        "document": [content],
-                                        "metadata": [metadata],
-                                        "source": {
-                                            "name": title,
-                                            "url": f"https://europepmc.org/article/MED/{pmid}",
-                                        },
-                                    },
-                                }
-                            )
+                    # Process each article
+                    for article in articles:
+                        # Extract PMID
+                        pmid = article.get("pmid", "")
+                        if pmid not in all_pmids:
+                            all_pmids.append(pmid)
+                            all_results.append(article)
+                            pmid_to_article[pmid] = article
+                            article_count += 1
+                        else:
+                            continue
                 
                 # Add search result to the details content
                 details_content += f"- Query {i+1}: `{search_query}` - Found {article_count} new articles\n"
@@ -439,14 +695,54 @@ Return ONLY a JSON object with the following format:
         # Add summary to the details content
         details_content += f"\n### Summary\nFound {len(all_pmids)} unique articles from {len(queries)} queries\n"
         
+        # Prepare filtered results and relevance scores
+        filtered_results = all_results
+        
+        # Reranking section
+        if use_reranking and cohere_api_key and all_results:
+            await emitter.emit("Preparing documents for reranking with Cohere")
+            details_content += "\n### Cohere Reranking\n"
+            
+            # Use the refactored reranking function
+            filtered_results = await self._rerank_with_cohere(
+                query=query,
+                all_articles=all_results,
+                api_key=cohere_api_key,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                top_n=top_n,
+                num_queries_rerank=user_valves.num_queries_rerank,
+                rerank_query_prompt=rerank_query_prompt,
+                mistral_api_key=mistral_api_key,
+                max_retries=max_retries,
+                __event_emitter__=__event_emitter__
+            )
+            
+            if len(filtered_results) < len(all_results):
+                details_content += f"- Reranking filtered results from {len(all_results)} to {len(filtered_results)} articles\n"
+            else:
+                details_content += "- No filtering applied, using all results\n"
+        else:
+            # No reranking, use all results
+            if not use_reranking:
+                details_content += "- Reranking disabled, using all results\n"
+            elif not cohere_api_key:
+                details_content += "- Cohere API key not provided, using all results\n"
+        
         # Close the details tag
         details_content += "</details>"
         
         # Emit the details content
         await emitter.emit_message(details_content)
-
+        
+        # Emit citations for articles
+        if citation_enabled and __event_emitter__:
+            await emitter.emit("Emitting citations for articles")
+            for article in filtered_results:
+                await emitter.emit_citation(article)
+        
         # Format results
-        formatted_results = self._format_results(all_results)
+        formatted_results = [self._format_results(x) for x in filtered_results]
 
         # Emit final status
         await emitter.emit(
@@ -456,42 +752,29 @@ Return ONLY a JSON object with the following format:
         )
 
         return formatted_results
-
-    def _format_results(self, articles: List[Dict]) -> str:
+    
+    def _format_results(self, article: Dict) -> str:
         """
         Format the results into a readable string.
 
         :param articles: List of article dictionaries
         :return: Formatted string with article information
         """
-        if not articles:
+        formatted_text = ""
+        if not article:
             return "No results found."
-
-        formatted_text = f"# EuropePMC Search Results\n\n"
-        formatted_text += f"Found {len(articles)} articles.\n\n"
-
-        for i, article in enumerate(articles):
-            title = article.get("title", "No title available")
-            authors = article.get("authorString", "Unknown authors")
-            journal = article.get("journalTitle", "Unknown journal")
-            year = article.get("pubYear", "Unknown year")
-            pmid = article.get("pmid", "")
-            doi = article.get("doi", "")
-
-            formatted_text += f"## {i+1}. {title}\n\n"
-            formatted_text += f"**Authors**: {authors}\n\n"
-            formatted_text += f"**Journal**: {journal}, {year}\n\n"
-
-            if pmid:
-                formatted_text += f"**PMID**: {pmid}\n\n"
-            if doi:
-                formatted_text += f"**DOI**: {doi}\n\n"
-
-            # Add abstract if available
-            abstract = article.get("abstractText", "")
-            if abstract:
-                formatted_text += f"**Abstract**: {abstract}\n\n"
-
-            formatted_text += "---\n\n"
-
+        title = article.get("title", "No title available")
+        authors = article.get("authorString", "Unknown authors")
+        journal = article.get("journalTitle", "Unknown journal")
+        year = article.get("pubYear", "Unknown year")
+        pmid = article.get("pmid", "")
+        doi = article.get("doi", "")
+        abstract = article.get("abstractText", "No abstract available")
+        formatted_text += f"## **Title**: {title}\n"
+        formatted_text += f"### **Authors**: {authors}\n"
+        formatted_text += f"### **Journal**: {journal}, {year}\n"
+        formatted_text += f"### **YEAR**: {year}\n"
+        formatted_text += f"### **PMID**: {pmid}\n"
+        formatted_text += f"### **DOI**: {doi}\n"
+        formatted_text += f"### **ABSTRACT**: \n{abstract}\n"
         return formatted_text
